@@ -1,0 +1,5 @@
+GeoBA - pasos:
+1. Abrí index.html con doble clic en tu navegador.
+2. Pegá tu API key de Google Maps y tocá "Jugar".
+La key necesita habilitada la "Maps JavaScript API" (console.cloud.google.com > APIs y servicios > Biblioteca).
+Si le ponés restricción por sitio web, agregá localhost/* o el dominio donde lo subas.

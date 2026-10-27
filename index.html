@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GeoBA – Adiviná dónde estás en Buenos Aires</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --acc:#38bdf8; --ok:#22c55e; --txt:#f1f5f9; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; font-family:system-ui,sans-serif; background:var(--bg); color:var(--txt); }
+  #pano { position:absolute; inset:0; }
+  #hud { position:absolute; top:12px; left:12px; z-index:5; display:flex; gap:8px; }
+  .pill { background:rgba(15,23,42,.85); padding:8px 14px; border-radius:999px; font-weight:600; font-size:14px; }
+  #mini { position:absolute; right:12px; bottom:24px; z-index:5; width:260px; height:180px;
+          transition:width .2s,height .2s; display:flex; flex-direction:column; gap:8px; }
+  #mini:hover, #mini.big { width:min(640px,92vw); height:min(440px,60vh); }
+  #map { flex:1; border-radius:10px; box-shadow:0 4px 20px rgba(0,0,0,.5); }
+  button { background:var(--acc); color:#04283a; border:0; border-radius:10px; padding:12px 18px;
+           font-size:15px; font-weight:700; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  #modal { position:absolute; inset:0; z-index:10; background:rgba(2,6,23,.8); display:none;
+           align-items:center; justify-content:center; padding:16px; }
+  #modal.show { display:flex; }
+  .card { background:var(--card); border-radius:16px; padding:24px; max-width:460px; width:100%; text-align:center; }
+  .card h2 { margin:0 0 8px; } .card p { margin:6px 0; color:#cbd5e1; }
+  .big-n { font-size:34px; font-weight:800; color:var(--acc); }
+  input { width:100%; padding:12px; border-radius:10px; border:1px solid #475569; background:#0f172a;
+          color:var(--txt); margin:10px 0; font-size:14px; }
+  #resmap { position:absolute; inset:0; z-index:6; display:none; }
+  #resbar { position:absolute; left:50%; bottom:24px; transform:translateX(-50%); z-index:8; display:none;
+            background:var(--card); padding:16px 22px; border-radius:14px; text-align:center; min-width:280px; }
+  #err { color:#fca5a5; font-size:13px; min-height:18px; }
+</style>
+</head>
+<body>
+<div id="pano"></div>
+<div id="hud"><div class="pill" id="round">Ronda 1/5</div><div class="pill" id="score">0 pts</div></div>
+<div id="mini">
+  <div id="map"></div>
+  <button id="guessBtn" disabled>Elegí un punto en el mapa</button>
+</div>
+<div id="resmap"></div>
+<div id="resbar">
+  <div id="resTxt"></div>
+  <button id="nextBtn" style="margin-top:10px">Siguiente</button>
+</div>
+
+<div id="modal" class="show">
+  <div class="card" id="card">
+    <h2>🧉 GeoBA</h2>
+    <p>Te dejamos en algún lugar de la Ciudad de Buenos Aires. Adiviná dónde estás.</p>
+    <input id="keyInput" placeholder="Tu Google Maps API key" autocomplete="off">
+    <div id="err"></div>
+    <button id="startBtn">Jugar</button>
+  </div>
+</div>
+
+<script>
+/* ===== Configuración ===== */
+// Podés pegar tu key acá o ingresarla en la pantalla inicial (se guarda en localStorage).
+const API_KEY = "";
+const ROUNDS = 5;
+const SCORE_SCALE_M = 3000;   // a mayor valor, más generoso el puntaje (CABA es chica)
+const MAX_POINTS = 5000;
+
+// Contorno aproximado de CABA (lat, lng). Ajustable.
+const CABA = [
+  [-34.5330,-58.4720],[-34.5450,-58.4500],[-34.5590,-58.4130],[-34.5750,-58.3900],
+  [-34.5870,-58.3730],[-34.6020,-58.3680],[-34.6300,-58.3630],[-34.6420,-58.3690],
+  [-34.6500,-58.3900],[-34.6600,-58.4100],[-34.6720,-58.4350],[-34.6870,-58.4580],
+  [-34.6950,-58.4700],[-34.6800,-58.4950],[-34.6500,-58.5100],[-34.6150,-58.5310],
+  [-34.5800,-58.5000],
+].map(([lat,lng]) => ({lat,lng}));
+
+/* ===== Estado ===== */
+let sv, panorama, map, resMap, guessMarker, guess, target;
+let round = 0, total = 0, overlays = [];
+const $ = id => document.getElementById(id);
+
+/* ===== Utilidades geo ===== */
+function inCABA(p) { // ray casting
+  let inside = false;
+  for (let i = 0, j = CABA.length - 1; i < CABA.length; j = i++) {
+    const a = CABA[i], b = CABA[j];
+    if ((a.lat > p.lat) !== (b.lat > p.lat) &&
+        p.lng < (b.lng - a.lng) * (p.lat - a.lat) / (b.lat - a.lat) + a.lng) inside = !inside;
+  }
+  return inside;
+}
+function haversine(a, b) {
+  const R = 6371000, r = x => x * Math.PI / 180;
+  const dLat = r(b.lat - a.lat), dLng = r(b.lng - a.lng);
+  const h = Math.sin(dLat/2)**2 + Math.cos(r(a.lat)) * Math.cos(r(b.lat)) * Math.sin(dLng/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+const fmtDist = m => m < 1000 ? `${Math.round(m)} m` : `${(m/1000).toFixed(2)} km`;
+
+function randomPoint() {
+  const lats = CABA.map(p => p.lat), lngs = CABA.map(p => p.lng);
+  const minLat = Math.min(...lats), maxLat = Math.max(...lats);
+  const minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
+  for (;;) {
+    const p = { lat: minLat + Math.random()*(maxLat-minLat), lng: minLng + Math.random()*(maxLng-minLng) };
+    if (inCABA(p)) return p;
+  }
+}
+
+/* Busca un panorama real de Street View dentro de CABA */
+async function findPano() {
+  for (let i = 0; i < 40; i++) {
+    const p = randomPoint();
+    try {
+      const { data } = await sv.getPanorama({
+        location: p, radius: 400,
+        preference: google.maps.StreetViewPreference.NEAREST,
+        source: google.maps.StreetViewSource.OUTDOOR,
+      });
+      const loc = { lat: data.location.latLng.lat(), lng: data.location.latLng.lng() };
+      if (inCABA(loc)) return { pano: data.location.pano, loc };
+    } catch (e) { /* ZERO_RESULTS: reintentar */ }
+  }
+  throw new Error("No se encontró Street View. Revisá que la API esté habilitada.");
+}
+
+/* ===== Flujo del juego ===== */
+async function startRound() {
+  round++;
+  $("round").textContent = `Ronda ${round}/${ROUNDS}`;
+  $("score").textContent = `${total} pts`;
+  $("resbar").style.display = "none";
+  $("resmap").style.display = "none";
+  $("mini").style.display = "flex";
+  $("mini").classList.remove("big");
+  guess = null;
+  if (guessMarker) { guessMarker.setMap(null); guessMarker = null; }
+  $("guessBtn").disabled = true;
+  $("guessBtn").textContent = "Elegí un punto en el mapa";
+  map.setCenter({ lat: -34.6037, lng: -58.4116 }); map.setZoom(11);
+
+  const found = await findPano();
+  target = found.loc;
+  panorama.setPano(found.pano);
+  panorama.setPov({ heading: Math.random()*360, pitch: 0 });
+  panorama.setVisible(true);
+}
+
+function endRound() {
+  const d = haversine(guess, target);
+  const pts = Math.round(MAX_POINTS * Math.exp(-d / SCORE_SCALE_M));
+  total += pts;
+  $("score").textContent = `${total} pts`;
+  $("mini").style.display = "none";
+
+  $("resmap").style.display = "block";
+  if (!resMap) {
+    resMap = new google.maps.Map($("resmap"), mapOpts());
+  }
+  overlays.forEach(o => o.setMap(null)); overlays = [];
+  overlays.push(
+    new google.maps.Marker({ map: resMap, position: guess, label: "Vos" }),
+    new google.maps.Marker({ map: resMap, position: target, label: "✔",
+      icon: { path: google.maps.SymbolPath.CIRCLE, scale: 12, fillColor: "#22c55e", fillOpacity: 1, strokeColor: "#fff", strokeWeight: 2 } }),
+    new google.maps.Polyline({ map: resMap, path: [guess, target], strokeColor: "#38bdf8", strokeOpacity: 0,
+      icons: [{ icon: { path: "M 0,-1 0,1", strokeOpacity: 1, scale: 3 }, offset: "0", repeat: "14px" }] })
+  );
+  const b = new google.maps.LatLngBounds(); b.extend(guess); b.extend(target);
+  resMap.fitBounds(b, 80);
+
+  $("resTxt").innerHTML = `<div>Estabas a</div><div class="big-n">${fmtDist(d)}</div><div>+${pts} puntos</div>`;
+  $("nextBtn").textContent = round >= ROUNDS ? "Ver resultado final" : "Siguiente";
+  $("resbar").style.display = "block";
+}
+
+function finish() {
+  $("resbar").style.display = "none";
+  $("resmap").style.display = "none";
+  $("card").innerHTML = `<h2>¡Terminó!</h2>
+    <div class="big-n">${total} / ${ROUNDS*MAX_POINTS}</div>
+    <p>${total > 20000 ? "Sos un taxista de ley 🚕" : total > 12000 ? "Bastante porteño/a 🧉" : "Te falta caminar más la ciudad 🚶"}</p>
+    <button onclick="location.reload()">Jugar de nuevo</button>`;
+  $("modal").classList.add("show");
+}
+
+const mapOpts = () => ({
+  center: { lat: -34.6037, lng: -58.4116 }, zoom: 11, disableDefaultUI: true, zoomControl: true,
+  gestureHandling: "greedy", clickableIcons: false,
+  restriction: { latLngBounds: { north: -34.30, south: -34.95, west: -58.80, east: -58.10 }, strictBounds: false },
+});
+
+function initGame() {
+  sv = new google.maps.StreetViewService();
+  panorama = new google.maps.StreetViewPanorama($("pano"), {
+    addressControl: false,      // no revela la calle
+    showRoadLabels: false,      // sin nombres de calles (si no, es trampa)
+    fullscreenControl: false, motionTracking: false, enableCloseButton: false,
+  });
+  map = new google.maps.Map($("map"), mapOpts());
+  new google.maps.Polygon({ map, paths: CABA, strokeColor: "#38bdf8", strokeWeight: 2, fillOpacity: 0.04, clickable: false });
+  map.addListener("click", e => {
+    guess = { lat: e.latLng.lat(), lng: e.latLng.lng() };
+    if (!guessMarker) guessMarker = new google.maps.Marker({ map, position: guess });
+    else guessMarker.setPosition(guess);
+    $("guessBtn").disabled = false;
+    $("guessBtn").textContent = "Adivinar";
+  });
+  $("guessBtn").onclick = () => guess && endRound();
+  $("nextBtn").onclick = () => round >= ROUNDS ? finish() : startRound();
+  $("modal").classList.remove("show");
+  startRound().catch(e => { $("modal").classList.add("show"); $("err").textContent = e.message; });
+}
+
+/* ===== Carga de la API ===== */
+function loadMaps(key) {
+  return new Promise((res, rej) => {
+    window.gm_authFailure = () => rej(new Error("API key inválida o sin permisos para Maps JavaScript / Street View."));
+    window.__mapsReady = res;
+    const s = document.createElement("script");
+    s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&v=weekly&callback=__mapsReady`;
+    s.async = true; s.onerror = () => rej(new Error("No se pudo cargar Google Maps."));
+    document.head.appendChild(s);
+  });
+}
+
+$("keyInput").value = API_KEY || localStorage.getItem("gmaps_key") || "";
+$("startBtn").onclick = async () => {
+  const key = $("keyInput").value.trim();
+  if (!key) { $("err").textContent = "Ingresá tu API key."; return; }
+  $("err").textContent = "Cargando…";
+  try {
+    await loadMaps(key);
+    localStorage.setItem("gmaps_key", key);
+    $("err").textContent = "";
+    initGame();
+  } catch (e) { $("err").textContent = e.message; }
+};
+</script>
+</body>
+</html>
