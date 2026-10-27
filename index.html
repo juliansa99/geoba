@@ -212,7 +212,11 @@ function initGame() {
 /* ===== Carga de la API ===== */
 function loadMaps(key) {
   return new Promise((res, rej) => {
-    window.gm_authFailure = () => rej(new Error("API key inválida o sin permisos para Maps JavaScript / Street View."));
+    window.gm_authFailure = () => {
+      rej(new Error("API key inválida o sin permisos para Maps JavaScript / Street View."));
+      $("modal").classList.add("show");
+      $("card").querySelector("#err").textContent = "Google rechazó la API key. Revisá que esté bien copiada, que tenga habilitada la Maps JavaScript API y que la facturación esté activa.";
+    };
     window.__mapsReady = res;
     const s = document.createElement("script");
     s.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(key)}&v=weekly&callback=__mapsReady`;
