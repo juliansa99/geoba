@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GeoBA (OpenStreetMap + Mapillary)</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/mapillary-js@4.1.2/dist/mapillary.css">
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --acc:#38bdf8; --txt:#f1f5f9; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; font-family:system-ui,sans-serif; background:var(--bg); color:var(--txt); }
+  #pano { position:absolute; inset:0; }
+  #hud { position:absolute; top:12px; left:12px; z-index:1000; display:flex; gap:8px; }
+  .pill { background:rgba(15,23,42,.85); padding:8px 14px; border-radius:999px; font-weight:600; font-size:14px; }
+  #mini { position:absolute; right:12px; bottom:24px; z-index:1000; width:260px; height:200px;
+          transition:width .2s,height .2s; display:flex; flex-direction:column; gap:8px; }
+  #mini:hover { width:min(640px,92vw); height:min(460px,60vh); }
+  #map { flex:1; border-radius:10px; box-shadow:0 4px 20px rgba(0,0,0,.5); }
+  button { background:var(--acc); color:#04283a; border:0; border-radius:10px; padding:12px 18px;
+           font-size:15px; font-weight:700; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  #modal { position:absolute; inset:0; z-index:2000; background:rgba(2,6,23,.85); display:none;
+           align-items:center; justify-content:center; padding:16px; }
+  #modal.show { display:flex; }
+  .card { background:var(--card); border-radius:16px; padding:24px; max-width:480px; width:100%; text-align:center; }
+  .card h2 { margin:0 0 8px; } .card p { margin:6px 0; color:#cbd5e1; font-size:14px; }
+  .card a { color:var(--acc); }
+  .big-n { font-size:34px; font-weight:800; color:var(--acc); }
+  input { width:100%; padding:12px; border-radius:10px; border:1px solid #475569; background:#0f172a;
+          color:var(--txt); margin:10px 0; font-size:14px; }
+  #resmap { position:absolute; inset:0; z-index:900; display:none; }
+  #resbar { position:absolute; left:50%; bottom:24px; transform:translateX(-50%); z-index:1000; display:none;
+            background:var(--card); padding:16px 22px; border-radius:14px; text-align:center; min-width:280px; }
+  #loading { position:absolute; inset:0; z-index:950; display:none; align-items:center; justify-content:center;
+             background:rgba(15,23,42,.8); font-weight:600; }
+  #err { color:#fca5a5; font-size:13px; min-height:18px; }
+</style>
+</head>
+<body>
+<div id="pano"></div>
+<div id="loading">Buscando un lugar en Buenos Aires…</div>
+<div id="hud"><div class="pill" id="round">Ronda 1/5</div><div class="pill" id="score">0 pts</div></div>
+<div id="mini">
+  <div id="map"></div>
+  <button id="guessBtn" disabled>Elegí un punto en el mapa</button>
+</div>
+<div id="resmap"></div>
+<div id="resbar">
+  <div id="resTxt"></div>
+  <button id="nextBtn" style="margin-top:10px">Siguiente</button>
+</div>
+
+<div id="modal" class="show">
+  <div class="card" id="card">
+    <h2>🧉 GeoBA</h2>
+    <p>Te dejamos en algún lugar de la Ciudad de Buenos Aires. Adiviná dónde estás.</p>
+    <p>Usa OpenStreetMap y Mapillary. Es gratis y no pide tarjeta.</p>
+    <input id="keyInput" placeholder="Tu token de Mapillary (empieza con MLY|)" autocomplete="off">
+    <p><a href="https://www.mapillary.com/dashboard/developers" target="_blank" rel="noopener">Conseguí tu token gratis acá</a></p>
+    <div id="err"></div>
+    <button id="startBtn">Jugar</button>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/mapillary-js@4.1.2/dist/mapillary.js"></script>
+<script>
+const ROUNDS = 5;
+const SCORE_SCALE_M = 3000;
+const MAX_POINTS = 5000;
+const CABA = [
+  [-34.5330,-58.4720],[-34.5450,-58.4500],[-34.5590,-58.4130],[-34.5750,-58.3900],
+  [-34.5870,-58.3730],[-34.6020,-58.3680],[-34.6300,-58.3630],[-34.6420,-58.3690],
+  [-34.6500,-58.3900],[-34.6600,-58.4100],[-34.6720,-58.4350],[-34.6870,-58.4580],
+  [-34.6950,-58.4700],[-34.6800,-58.4950],[-34.6500,-58.5100],[-34.6150,-58.5310],
+  [-34.5800,-58.5000],
+].map(([lat,lng]) => ({lat,lng}));
+const CENTER = [-34.6037, -58.4416];
+
+let token, viewer, map, resMap, guessMarker, guess, target, overlays = [];
+let round = 0, total = 0;
+const $ = id => document.getElementById(id);
+
+function inCABA(p) {
+  let inside = false;
+  for (let i = 0, j = CABA.length - 1; i < CABA.length; j = i++) {
+    const a = CABA[i], b = CABA[j];
+    if ((a.lat > p.lat) !== (b.lat > p.lat) &&
+        p.lng < (b.lng - a.lng) * (p.lat - a.lat) / (b.lat - a.lat) + a.lng) inside = !inside;
+  }
+  return inside;
+}
+function haversine(a, b) {
+  const R = 6371000, r = x => x * Math.PI / 180;
+  const dLat = r(b.lat - a.lat), dLng = r(b.lng - a.lng);
+  const h = Math.sin(dLat/2)**2 + Math.cos(r(a.lat)) * Math.cos(r(b.lat)) * Math.sin(dLng/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+const fmtDist = m => m < 1000 ? `${Math.round(m)} m` : `${(m/1000).toFixed(2)} km`;
+
+function randomPoint() {
+  const lats = CABA.map(p => p.lat), lngs = CABA.map(p => p.lng);
+  const minLat = Math.min(...lats), maxLat = Math.max(...lats);
+  const minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
+  for (;;) {
+    const p = { lat: minLat + Math.random()*(maxLat-minLat), lng: minLng + Math.random()*(maxLng-minLng) };
+    if (inCABA(p)) return p;
+  }
+}
+
+/* Busca una foto de Mapillary en un cuadrado de ~600 m alrededor de un punto al azar */
+async function findImage() {
+  const d = 0.003;
+  for (let i = 0; i < 30; i++) {
+    const c = randomPoint();
+    const bbox = [c.lng - d, c.lat - d, c.lng + d, c.lat + d].join(",");
+    const url = `https://graph.mapillary.com/images?access_token=${encodeURIComponent(token)}` +
+                `&fields=id,geometry&bbox=${bbox}&limit=100`;
+    const r = await fetch(url);
+    if (r.status === 401 || r.status === 403) throw new Error("Mapillary rechazó el token. Revisá que esté bien copiado.");
+    if (!r.ok) continue;
+    const { data } = await r.json();
+    const ok = (data || [])
+      .map(x => ({ id: x.id, loc: { lat: x.geometry.coordinates[1], lng: x.geometry.coordinates[0] } }))
+      .filter(x => inCABA(x.loc));
+    if (ok.length) return ok[Math.floor(Math.random() * ok.length)];
+  }
+  throw new Error("No se encontraron fotos de calle. Probá de nuevo.");
+}
+
+async function startRound() {
+  round++;
+  $("round").textContent = `Ronda ${round}/${ROUNDS}`;
+  $("score").textContent = `${total} pts`;
+  $("resbar").style.display = "none";
+  $("resmap").style.display = "none";
+  $("mini").style.display = "flex";
+  guess = null;
+  if (guessMarker) { map.removeLayer(guessMarker); guessMarker = null; }
+  $("guessBtn").disabled = true;
+  $("guessBtn").textContent = "Elegí un punto en el mapa";
+  map.invalidateSize(); map.setView(CENTER, 11);
+
+  $("loading").style.display = "flex";
+  try {
+    const img = await findImage();
+    target = img.loc;
+    if (!viewer) {
+      viewer = new mapillary.Viewer({
+        accessToken: token, container: "pano", imageId: img.id,
+        component: { cover: false },
+      });
+      window.addEventListener("resize", () => viewer.resize());
+    } else {
+      await viewer.moveTo(img.id);
+    }
+  } finally {
+    $("loading").style.display = "none";
+  }
+}
+
+function endRound() {
+  const d = haversine(guess, target);
+  const pts = Math.round(MAX_POINTS * Math.exp(-d / SCORE_SCALE_M));
+  total += pts;
+  $("score").textContent = `${total} pts`;
+  $("mini").style.display = "none";
+  $("resmap").style.display = "block";
+  if (!resMap) resMap = makeMap("resmap");
+  resMap.invalidateSize();
+  overlays.forEach(o => resMap.removeLayer(o)); overlays = [];
+  const g = [guess.lat, guess.lng], t = [target.lat, target.lng];
+  overlays.push(
+    L.circleMarker(g, { radius: 9, color: "#fff", weight: 2, fillColor: "#38bdf8", fillOpacity: 1 }).bindTooltip("Vos", { permanent: true, direction: "top" }).addTo(resMap),
+    L.circleMarker(t, { radius: 10, color: "#fff", weight: 2, fillColor: "#22c55e", fillOpacity: 1 }).bindTooltip("Lugar real", { permanent: true, direction: "top" }).addTo(resMap),
+    L.polyline([g, t], { color: "#38bdf8", dashArray: "8 8", weight: 3 }).addTo(resMap)
+  );
+  resMap.fitBounds([g, t], { padding: [90, 90], maxZoom: 17 });
+  $("resTxt").innerHTML = `<div>Estabas a</div><div class="big-n">${fmtDist(d)}</div><div>+${pts} puntos</div>`;
+  $("nextBtn").textContent = round >= ROUNDS ? "Ver resultado final" : "Siguiente";
+  $("resbar").style.display = "block";
+}
+
+function finish() {
+  $("resbar").style.display = "none";
+  $("resmap").style.display = "none";
+  $("card").innerHTML = `<h2>¡Terminó!</h2>
+    <div class="big-n">${total} / ${ROUNDS*MAX_POINTS}</div>
+    <p>${total > 20000 ? "Sos un taxista de ley 🚕" : total > 12000 ? "Bastante porteño/a 🧉" : "Te falta caminar más la ciudad 🚶"}</p>
+    <button onclick="location.reload()">Jugar de nuevo</button>`;
+  $("modal").classList.add("show");
+}
+
+function makeMap(id) {
+  const m = L.map(id, { center: CENTER, zoom: 11, zoomControl: true });
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19, attribution: "© OpenStreetMap",
+  }).addTo(m);
+  return m;
+}
+
+function initGame() {
+  map = makeMap("map");
+  L.polygon(CABA.map(p => [p.lat, p.lng]), { color: "#38bdf8", weight: 2, fillOpacity: 0.04, interactive: false }).addTo(map);
+  map.on("click", e => {
+    guess = { lat: e.latlng.lat, lng: e.latlng.lng };
+    if (!guessMarker) guessMarker = L.marker(e.latlng).addTo(map); else guessMarker.setLatLng(e.latlng);
+    $("guessBtn").disabled = false;
+    $("guessBtn").textContent = "Adivinar";
+  });
+  const mini = $("mini");
+  ["transitionend", "mouseenter", "mouseleave"].forEach(ev => mini.addEventListener(ev, () => setTimeout(() => map.invalidateSize(), 220)));
+  $("guessBtn").onclick = () => guess && endRound();
+  $("nextBtn").onclick = () => round >= ROUNDS ? finish() : startRound().catch(showErr);
+  $("modal").classList.remove("show");
+  startRound().catch(showErr);
+}
+
+function showErr(e) {
+  $("modal").classList.add("show");
+  $("err").textContent = e.message;
+}
+
+try { $("keyInput").value = localStorage.getItem("mly_token") || ""; } catch (e) {}
+$("startBtn").onclick = () => {
+  token = $("keyInput").value.trim();
+  if (!token) { $("err").textContent = "Pegá tu token de Mapillary."; return; }
+  try { localStorage.setItem("mly_token", token); } catch (e) {}
+  $("err").textContent = "";
+  initGame();
+};
+</script>
+</body>
+</html>

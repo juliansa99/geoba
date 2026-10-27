@@ -3,3 +3,7 @@ GeoBA - pasos:
 2. Pegá tu API key de Google Maps y tocá "Jugar".
 La key necesita habilitada la "Maps JavaScript API" (console.cloud.google.com > APIs y servicios > Biblioteca).
 Si le ponés restricción por sitio web, agregá localhost/* o el dominio donde lo subas.
+
+Versión gratis (sin Google, sin tarjeta): osm.html
+Usa OpenStreetMap + Mapillary. Necesita un token gratuito de Mapillary:
+https://www.mapillary.com/dashboard/developers  (Register application -> copiar el "Client Token", empieza con MLY|)
